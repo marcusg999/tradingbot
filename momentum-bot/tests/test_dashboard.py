@@ -75,6 +75,49 @@ def test_render_html_is_valid_and_readonly(populated):
     assert "<form" not in page.lower()
 
 
+def test_equity_chart_empty_placeholder():
+    svg = dashboard.render_equity_chart([], 10_000.0)
+    assert "collecting" in svg.lower()
+    assert "<svg" not in svg  # placeholder, not a chart
+    # A single point is still not enough to draw a line.
+    assert "<svg" not in dashboard.render_equity_chart([["t", 10_000.0]], 10_000.0)
+
+
+def test_equity_chart_renders_svg():
+    pts = [["t0", 10_000.0], ["t1", 10_120.0], ["t2", 10_080.0], ["t3", 10_250.0]]
+    svg = dashboard.render_equity_chart(pts, 10_000.0)
+    assert svg.startswith("<svg") and "polyline" in svg
+    assert "stroke-dasharray" in svg           # day-start baseline drawn
+    assert "#3fb950" in svg                     # green: ends above baseline
+
+
+def test_equity_chart_red_when_below_baseline():
+    pts = [["t0", 10_000.0], ["t1", 9_800.0], ["t2", 9_600.0]]
+    svg = dashboard.render_equity_chart(pts, 10_000.0)
+    assert "#f85149" in svg                     # red: ends below day start
+
+
+def test_equity_chart_flat_line_no_crash():
+    pts = [["t0", 10_000.0]] * 3   # zero range must not divide by zero
+    svg = dashboard.render_equity_chart([["t%d" % i, 10_000.0] for i in range(3)],
+                                        10_000.0)
+    assert "<svg" in svg
+
+
+def test_snapshot_and_html_include_chart(populated):
+    cfg, reader = populated
+    # Add some equity samples via a writable connection.
+    st = State(reader.db_path, reader.db_path + ".csv")
+    for v in (10_000, 10_050, 10_020, 10_150):
+        st.record_equity(float(v))
+    st.close()
+    snap = dashboard.build_snapshot(cfg, reader)
+    assert len(snap["equity_history"]) == 4
+    page = dashboard.render_html(snap)
+    assert "Equity &amp; P&amp;L" in page and "<svg" in page
+    assert "samples" in page
+
+
 def test_kill_switch_banner_renders(populated, tmp_path):
     cfg, reader = populated
     # Flip the kill switch in a fresh writable connection, then re-read.

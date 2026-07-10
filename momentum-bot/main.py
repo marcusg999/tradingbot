@@ -401,6 +401,7 @@ class Engine:
     def run_once(self) -> None:
         equity = self.broker.get_equity()
         day_start = self.state.roll_day_if_needed(equity)
+        self.state.record_equity(equity)  # time-series for the dashboard chart
 
         if self.check_kill_switch(day_start, equity):
             self.log.critical("TRADING HALTED (kill switch). Reason: %s. "

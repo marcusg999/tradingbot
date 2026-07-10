@@ -19,6 +19,10 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 
+# Retention cap for the equity-history table (~2 days at one sample/minute).
+MAX_EQUITY_POINTS = 3000
+
+
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -81,6 +85,12 @@ class State:
                 pnl REAL,
                 reason_entry TEXT,
                 reason_exit TEXT
+            )""")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS equity_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                equity REAL NOT NULL
             )""")
         self.conn.commit()
 
@@ -200,6 +210,28 @@ class State:
         with open(self.trades_csv_path, "a", newline="") as fh:
             csv.writer(fh).writerow([ts, symbol, side, qty, entry, exit,
                                      stop, pnl, reason_entry, reason_exit])
+
+    # --- equity history (for the dashboard chart) -----------------------
+    def record_equity(self, equity: float, ts: Optional[str] = None) -> None:
+        """Append an equity sample and prune to the retention cap."""
+        ts = ts or _utcnow_iso()
+        self.conn.execute(
+            "INSERT INTO equity_history(timestamp, equity) VALUES(?, ?)",
+            (ts, equity))
+        # Keep the table bounded (roughly MAX_EQUITY_POINTS most-recent rows).
+        self.conn.execute(
+            "DELETE FROM equity_history WHERE id <= "
+            "(SELECT MAX(id) FROM equity_history) - ?", (MAX_EQUITY_POINTS,))
+        self.conn.commit()
+
+    def equity_history(self, limit: Optional[int] = None):
+        """Return [(timestamp, equity), ...] oldest-first."""
+        q = "SELECT timestamp, equity FROM equity_history ORDER BY id ASC"
+        rows = self.conn.execute(q).fetchall()
+        out = [(r["timestamp"], float(r["equity"])) for r in rows]
+        if limit is not None and len(out) > limit:
+            out = out[-limit:]
+        return out
 
     def close(self) -> None:
         self.conn.close()

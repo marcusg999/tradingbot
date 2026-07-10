@@ -226,9 +226,10 @@ The same ledger is kept in SQLite (`state.db`, table `trades`) for querying.
 ### Optional: read-only web dashboard
 
 A separate, **read-only** process shows what the bot is doing in a browser —
-equity, open positions, live unrealized P&L, kill-switch status, and the recent
-trade ledger. It opens the state file in read-only mode and has **no** endpoints
-that place, cancel, or modify orders (mutating HTTP methods return `405`).
+an **equity/P&L curve**, current equity, open positions, live unrealized P&L,
+kill-switch status, and the recent trade ledger. It opens the state file in
+read-only mode and has **no** endpoints that place, cancel, or modify orders
+(mutating HTTP methods return `405`).
 
 ```bash
 python dashboard.py          # serves on http://0.0.0.0:8080
@@ -245,6 +246,9 @@ connected; they populate with live data once keys are set.)*
 - Reads `state.db` + `trades.csv`. If Alpaca keys are set (and
   `DASHBOARD_LIVE` isn't `false`) it also shows **live** equity and unrealized
   P&L; otherwise it degrades to local state only.
+- The **equity chart** is an inline SVG (no JS/CDN) drawn from an
+  equity-history table the bot appends to each cycle, with a dashed day-start
+  baseline so intraday P&L is obvious at a glance.
 - Config: `DASHBOARD_PORT` (default `8080`), `DASHBOARD_HOST` (default
   `0.0.0.0`), `DASHBOARD_LIVE` (default `true`).
 - Zero extra dependencies — built on Python's stdlib `http.server`.

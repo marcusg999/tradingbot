@@ -77,9 +77,19 @@ class StateReader:
                 "positions": positions,
                 "recent_trades": trades,
                 "stats": stats,
+                "equity_history": self._equity_history(conn),
             }
         finally:
             conn.close()
+
+    def _equity_history(self, conn: sqlite3.Connection) -> List[list]:
+        try:
+            rows = conn.execute(
+                "SELECT timestamp, equity FROM equity_history ORDER BY id ASC"
+            ).fetchall()
+        except sqlite3.Error:
+            return []
+        return [[r["timestamp"], float(r["equity"])] for r in rows]
 
     def _trade_stats(self, conn: sqlite3.Connection) -> Dict[str, Any]:
         try:
@@ -162,6 +172,68 @@ def _fmt_num(v: Any, digits: int = 6) -> str:
         return "—"
 
 
+def render_equity_chart(points: List[list], day_start: Optional[float],
+                        width: int = 1040, height: int = 150) -> str:
+    """Inline SVG equity curve with a dashed day-start baseline.
+
+    Self-contained (no JS/CDN) so it works under a strict CSP. Colours green
+    when the latest equity is at/above the day-start baseline, red below.
+    """
+    if not points or len(points) < 2:
+        return ('<div class="muted chart-empty">Equity chart — collecting '
+                'data (one sample per cycle)…</div>')
+
+    # Downsample so the polyline stays light regardless of history length.
+    max_pts = 240
+    if len(points) > max_pts:
+        step = len(points) / max_pts
+        points = [points[int(i * step)] for i in range(max_pts)]
+    vals = [p[1] for p in points]
+
+    lo, hi = min(vals), max(vals)
+    if day_start:
+        lo, hi = min(lo, day_start), max(hi, day_start)
+    if hi == lo:                      # flat line: avoid zero range
+        hi = lo + max(1.0, abs(lo) * 0.01)
+    pad = (hi - lo) * 0.08
+    lo -= pad
+    hi += pad
+
+    n = len(vals)
+    padL, padR, padT, padB = 8, 8, 10, 12
+    plot_w = width - padL - padR
+    plot_h = height - padT - padB
+
+    def X(i: int) -> float:
+        return padL + plot_w * i / (n - 1)
+
+    def Y(v: float) -> float:
+        return padT + plot_h * (1 - (v - lo) / (hi - lo))
+
+    line = " ".join(f"{X(i):.1f},{Y(v):.1f}" for i, v in enumerate(vals))
+    base_y = padT + plot_h
+    area = f"{X(0):.1f},{base_y:.1f} {line} {X(n - 1):.1f},{base_y:.1f}"
+
+    up = (day_start is None) or (vals[-1] >= day_start)
+    stroke = "#3fb950" if up else "#f85149"
+    fill = "rgba(63,185,80,0.14)" if up else "rgba(248,81,73,0.14)"
+
+    baseline = ""
+    if day_start:
+        by = Y(day_start)
+        baseline = (f'<line x1="{padL}" y1="{by:.1f}" x2="{padL + plot_w:.1f}" '
+                    f'y2="{by:.1f}" stroke="#6e7681" stroke-width="1" '
+                    f'stroke-dasharray="4 4"/>')
+    return (
+        f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" '
+        f'preserveAspectRatio="none" role="img" aria-label="Equity over time">'
+        f'<polygon points="{area}" fill="{fill}"/>'
+        f'{baseline}'
+        f'<polyline points="{line}" fill="none" stroke="{stroke}" '
+        f'stroke-width="2" stroke-linejoin="round"/>'
+        f'</svg>')
+
+
 def render_html(snap: Dict[str, Any]) -> str:
     e = html.escape
     mode = snap.get("mode", "PAPER")
@@ -237,6 +309,17 @@ def render_html(snap: Dict[str, Any]) -> str:
     win_line = (f"{win_rate:.0%} win rate ({stats.get('wins',0)}/"
                 f"{stats.get('closed',0)} closed)")
 
+    # Equity chart + a small min/current/max caption.
+    hist = snap.get("equity_history", [])
+    chart_svg = render_equity_chart(hist, snap.get("day_start_equity"))
+    chart_caption = ""
+    if len(hist) >= 2:
+        evals = [h[1] for h in hist]
+        chart_caption = (
+            f'<span class="muted">low {_fmt_money(min(evals))} · '
+            f'now {_fmt_money(evals[-1])} · high {_fmt_money(max(evals))} · '
+            f'{len(hist)} samples</span>')
+
     return f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8">
@@ -273,6 +356,11 @@ def render_html(snap: Dict[str, Any]) -> str:
     white-space:nowrap; }}
   th {{ color:#8b949e; font-weight:600; font-size:11px; text-transform:uppercase; }}
   .pos {{ color:#3fb950; }} .neg {{ color:#f85149; }}
+  .chart {{ background:#161b22; border:1px solid #30363d; border-radius:10px;
+    padding:8px 6px 2px; margin-bottom:8px; }}
+  .chart-empty {{ padding:28px 0; }}
+  h2 .muted {{ font-size:11px; text-transform:none; letter-spacing:0;
+    font-weight:400; margin-left:6px; }}
   .muted {{ color:#6e7681; text-align:center; font-style:italic; }}
   .foot {{ color:#6e7681; font-size:11px; margin-top:20px; }}
 </style></head>
@@ -282,6 +370,9 @@ def render_html(snap: Dict[str, Any]) -> str:
     updated {e(snap.get("generated_at",""))} (auto-refresh 15s)</div>
   {kill_banner}
   <div class="cards">{card_html}</div>
+
+  <h2>Equity &amp; P&amp;L {chart_caption}</h2>
+  <div class="chart">{chart_svg}</div>
 
   <h2>Open positions</h2>
   <div class="wrap"><table>
