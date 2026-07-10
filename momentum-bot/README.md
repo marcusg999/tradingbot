@@ -153,20 +153,35 @@ pytest
 You should see:
 
 ```text
-55 passed in 0.76s
+84 passed in 1.6s
 ```
 
 ---
 
 ## 3. Usage — running the bot
 
+**First, verify your Alpaca connection** (read-only — places no orders):
+
+```bash
+python scripts/check_connection.py
+```
+
+It confirms your keys work and the bot can reach both the trading and
+market-data endpoints, printing the endpoint used (paper vs live), your equity,
+open positions, and a sample candle. Exit code 0 means you're ready. Note the
+bot always targets `https://paper-api.alpaca.markets` in paper mode
+automatically — the endpoint is derived from the paper/live flags, so there is
+no base URL to configure.
+
+Then run it:
+
 ```bash
 python main.py
 ```
 
-That's it — `.env` is loaded automatically. The bot reconciles against your
-Alpaca account, then checks stops every 60 seconds and evaluates signals each
-time an hourly candle closes. Leave it running (see
+`.env` is loaded automatically. The bot reconciles against your Alpaca account,
+then checks stops every 60 seconds and evaluates signals each time an hourly
+candle closes. Leave it running (see
 [Deployment](#5-deployment-docker--railway) for 24/7 operation).
 
 ### 📸 What you'll see: startup
