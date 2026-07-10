@@ -18,6 +18,8 @@ venv/
 .coverage
 htmlcov/
 tests/
+docs/
+*.png
 .DS_Store
 .idea/
 .vscode/
