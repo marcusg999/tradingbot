@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -33,14 +34,13 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
-_CONFIGURED = False
+_configured_names: set = set()
 
 
 def get_logger(name: str = "momentum-bot", level: str = "INFO",
                json_output: bool = False) -> logging.Logger:
-    global _CONFIGURED
     logger = logging.getLogger(name)
-    if not _CONFIGURED:
+    if name not in _configured_names:
         handler = logging.StreamHandler(sys.stdout)
         if json_output:
             handler.setFormatter(_JsonFormatter())
@@ -51,7 +51,7 @@ def get_logger(name: str = "momentum-bot", level: str = "INFO",
             ))
         logger.addHandler(handler)
         logger.propagate = False
-        _CONFIGURED = True
+        _configured_names.add(name)
     logger.setLevel(getattr(logging, level, logging.INFO))
     return logger
 
@@ -72,20 +72,29 @@ class Notifier:
         self.enabled = bool(self.discord or (self.tg_token and self.tg_chat))
 
     def send(self, title: str, body: str) -> None:
+        """Fire-and-forget: posts happen on a daemon thread so a slow webhook
+        endpoint can never stall the trading loop."""
         if not self.enabled:
             return
         text = f"**{title}**\n{body}"
         if self.discord:
-            self._post_json(self.discord, {"content": text})
+            self._post_async(self.discord, {"content": text})
         if self.tg_token and self.tg_chat:
             url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
-            self._post_json(url, {"chat_id": self.tg_chat, "text": f"{title}\n{body}"})
+            self._post_async(url, {"chat_id": self.tg_chat,
+                                   "text": f"{title}\n{body}"})
+
+    def _post_async(self, url: str, payload: dict) -> None:
+        threading.Thread(target=self._post_json, args=(url, payload),
+                         daemon=True).start()
 
     def _post_json(self, url: str, payload: dict) -> None:
         try:
             data = json.dumps(payload).encode("utf-8")
             req = urllib.request.Request(
                 url, data=data, headers={"Content-Type": "application/json"})
-            urllib.request.urlopen(req, timeout=10).read()
+            urllib.request.urlopen(req, timeout=5).read()
         except (urllib.error.URLError, OSError, ValueError) as exc:  # pragma: no cover
-            self.log.warning("notifier post failed: %s", exc)
+            # Exception text can embed the URL (which contains the Telegram
+            # token) — log only the class name.
+            self.log.warning("notifier post failed: %s", type(exc).__name__)

@@ -115,15 +115,15 @@ class State:
     def roll_day_if_needed(self, current_equity: float) -> float:
         """Ensure day-start equity is set for today (UTC). Returns it.
 
-        Rolling to a new day also clears the kill switch so a fresh session
-        starts clean.
+        Deliberately does NOT touch the kill switch: a triggered halt persists
+        across day rolls and process restarts until an operator clears it
+        (main.py --reset-kill-switch or RESET_KILL_SWITCH=yes).
         """
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         existing = self.get_day_start()
         if existing is None or existing[0] != today:
             self._set_meta("day_start_date", today)
             self._set_meta("day_start_equity", str(current_equity))
-            self.set_kill_switch(False, "new_day")
             return current_equity
         return existing[1]
 

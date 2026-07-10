@@ -42,6 +42,12 @@ def test_symbol_list_override(monkeypatch):
     assert c.symbols == ["BTC/USD", "SOL/USD", "DOGE/USD"]
 
 
+def test_symbols_normalized_to_slash_form(monkeypatch):
+    # Collapsed or lowercase input must still produce data-API-valid pairs.
+    c = reload_config(monkeypatch, {"SYMBOLS": "BTCUSD, eth/usd"})
+    assert c.symbols == ["BTC/USD", "ETH/USD"]
+
+
 def test_numeric_overrides(monkeypatch):
     c = reload_config(monkeypatch, {
         "RISK_PER_TRADE": "0.01", "EMA_FAST": "9", "EMA_SLOW": "21"})

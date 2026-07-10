@@ -26,6 +26,8 @@ from alpaca.trading.requests import (
     StopLimitOrderRequest,
 )
 
+from config import normalize_symbol
+
 
 @dataclass
 class Candle:
@@ -57,21 +59,19 @@ class PositionInfo:
     unrealized_pl: float
 
 
-def normalize_symbol(symbol: str) -> str:
-    """Return the canonical 'BASE/QUOTE' form (Alpaca positions drop the '/')."""
-    s = symbol.upper()
-    if "/" in s:
-        return s
-    for quote in ("USDT", "USDC", "USD"):
-        if s.endswith(quote):
-            return f"{s[:-len(quote)]}/{quote}"
-    return s
+def round_price(price: float) -> float:
+    """Round to 2 decimals for dollar-priced assets, 6 significant digits
+    below $1 so sub-dollar pairs (DOGE, SHIB, ...) keep their precision."""
+    if price >= 1:
+        return round(price, 2)
+    return float(f"{price:.6g}")
 
 
 class Broker:
     # Limit price is placed this far below the stop trigger so a triggered
-    # stop_limit still fills through modest slippage.
-    STOP_LIMIT_SLIPPAGE = 0.005
+    # stop_limit still fills through fast-market slippage. Crypto moves hard;
+    # a thin band risks the stop triggering but resting unfilled below.
+    STOP_LIMIT_SLIPPAGE = 0.02
 
     def __init__(self, config) -> None:
         self.c = config
@@ -148,8 +148,8 @@ class Broker:
 
     def submit_stop_sell(self, symbol: str, qty: float, stop_price: float):
         """Server-side stop_limit sell — the hard/trailing stop."""
-        stop_price = round(stop_price, 2)
-        limit_price = round(stop_price * (1.0 - self.STOP_LIMIT_SLIPPAGE), 2)
+        stop_price = round_price(stop_price)
+        limit_price = round_price(stop_price * (1.0 - self.STOP_LIMIT_SLIPPAGE))
         req = StopLimitOrderRequest(
             symbol=symbol, qty=round(qty, 9), side=OrderSide.SELL,
             time_in_force=TimeInForce.GTC,
@@ -166,7 +166,9 @@ class Broker:
         self.trading.cancel_orders()
 
     def close_position(self, symbol: str):
-        return self.trading.close_position(symbol)
+        # Position endpoints are path-parameter based; a '/' in the symbol
+        # corrupts the URL, so use the collapsed form (BTC/USD -> BTCUSD).
+        return self.trading.close_position(symbol.replace("/", ""))
 
     def close_all_positions(self) -> None:
         self.trading.close_all_positions(cancel_orders=True)

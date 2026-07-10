@@ -28,9 +28,9 @@ in, signal out), so the backtester and the live bot run *identical* code.
 | Control | Default | Behaviour |
 |---|---|---|
 | Position sizing | 2% equity/trade | Size derived from the stop distance so a stop-out loses ~2% of equity |
-| Hard stop | 3% below entry | A **real server-side stop order** at Alpaca, not tracked in memory |
-| Trailing stop | activate +4%, trail 2.5% | Ratchets the server-side stop up as price rises; never moves down |
-| Daily kill switch | −5% from day start | Closes all positions, cancels all orders, halts until manual restart |
+| Hard stop | 3% below entry | A **real server-side stop-limit order** at Alpaca (2% limit band), not tracked in memory; a per-cycle gap check forces a market exit if price blows through the band unfilled |
+| Trailing stop | activate +4%, trail 2.5% | Ratchets the server-side stop up as price rises; never moves down; the bot re-verifies a live stop exists every cycle |
+| Daily kill switch | −5% from day start | Closes all positions, cancels all orders, halts. **Persists across restarts and day rolls** until you reset it: `python main.py --reset-kill-switch` (or set `RESET_KILL_SWITCH=yes` once, then unset it) |
 | Max total exposure | 50% of equity | Never more than half of equity deployed across all positions |
 | Order sanity checks | 25% / 5 min | Rejects orders > 25% of equity or on price data older than 5 minutes |
 
@@ -86,9 +86,7 @@ momentum-bot/
 
 5. **Run the bot locally** (paper):
    ```bash
-   # load .env into the environment, then run
-   set -a && . ./.env && set +a
-   python main.py
+   python main.py    # .env is loaded automatically via python-dotenv
    ```
    You'll see a `Running in PAPER mode` warning, a reconcile pass, then a
    `cycle` log each minute with equity, exposure, unrealized P&L, and the last
@@ -99,12 +97,13 @@ momentum-bot/
 ## 2. Backtesting
 
 ```bash
-set -a && . ./.env && set +a       # loads keys (crypto data works without them too)
-python backtest.py --symbol BTC/USD --days 180
+python backtest.py --symbol BTC/USD --days 180 --fee-bps 25
 ```
 
 Flags: `--symbol` (default `BTC/USD`), `--days` (default `180`),
-`--cash` (starting equity, default `10000`).
+`--cash` (starting equity, default `10000`), `--fee-bps` (fee per side in
+basis points; Alpaca's crypto taker fee is ~25 bps — use it for honest
+numbers).
 
 The report prints total return, max drawdown, win rate, profit factor, number
 of trades, and — honestly — the **buy-and-hold benchmark** for the same window
@@ -118,8 +117,9 @@ say so plainly rather than cherry-pick.
 - *Max drawdown* is your emotional stress test — could you hold through it live?
 - Compare **vs buy-and-hold**: if it doesn't beat holding after costs, it isn't
   adding value on that window. One good window is not an edge; test several.
-- Backtests here assume fills at candle close / stop price and **do not model
-  fees or slippage** — real results will be worse.
+- Backtests assume fills at candle close / stop price. Fees are modeled only
+  when you pass `--fee-bps`; **slippage is never modeled** — real results will
+  be worse.
 
 ---
 
@@ -150,8 +150,9 @@ say so plainly rather than cherry-pick.
 - [ ] Read the entire `trades.csv` ledger. **Understand every single loss** —
       why it entered, why it exited, whether the stop behaved as designed.
 - [ ] Confirm the kill switch fired correctly at least once (you can lower
-      `DAILY_KILL_PCT` temporarily on paper to force it) and that it halted
-      trading and required a manual restart.
+      `DAILY_KILL_PCT` temporarily on paper to force it), that it halted
+      trading, that a plain restart did NOT resume trading, and that
+      `--reset-kill-switch` did.
 - [ ] Verify stops exist server-side in the Alpaca dashboard for open positions.
 - [ ] Re-run the backtest across several windows and symbols; confirm you are
       comfortable with the drawdowns.

@@ -1,3 +1,5 @@
-alpaca-py>=0.33.0
-python-dotenv>=1.0.0
-pytest>=8.0.0
+# Pinned for reproducible builds — an unattended trading bot must not pick up
+# breaking SDK changes on redeploy. Bump deliberately and re-run the tests.
+alpaca-py==0.43.5
+python-dotenv==1.2.2
+pytest==9.1.1

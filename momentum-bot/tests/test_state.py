@@ -29,12 +29,16 @@ def test_kill_switch_persist(store):
     assert store.kill_switch_reason() == "test reason"
 
 
-def test_new_day_clears_kill_switch(store, monkeypatch):
+def test_new_day_does_NOT_clear_kill_switch(store):
+    # The halt must persist across day rolls (and restarts) until an operator
+    # explicitly resets it — no silent resume at UTC midnight.
     store.roll_day_if_needed(10_000.0)
     store.set_kill_switch(True, "halt")
-    # Force a different recorded day so the next roll triggers a reset.
     store._set_meta("day_start_date", "1970-01-01")
     store.roll_day_if_needed(10_000.0)
+    assert store.is_kill_switch_active() is True
+    # ...and an explicit reset clears it.
+    store.set_kill_switch(False, "manual_reset")
     assert store.is_kill_switch_active() is False
 
 

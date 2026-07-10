@@ -133,16 +133,19 @@ class BacktestResult:
 
 
 def run_backtest(candles: List[BTCandle], cfg, symbol: str,
-                 initial_equity: float) -> BacktestResult:
+                 initial_equity: float, fee_bps: float = 0.0) -> BacktestResult:
     """Bar-by-bar simulation mirroring the live decision flow.
 
     Each closed candle: if flat, evaluate the entry signal on close; if in a
-    position, first check whether the intrabar low pierced the (possibly
-    trailed) stop, then evaluate the exit signal on close.
+    position, first check the stop as it stood at the END of the PREVIOUS bar
+    (a ratchet from this bar's high must not rescue this bar's low — the
+    intrabar sequence is unknown), then ratchet the trail, then evaluate the
+    signal exit on close. ``fee_bps`` is charged per side on notional.
     """
     result = BacktestResult(symbol=symbol, days=0,
                             initial_equity=initial_equity,
                             final_equity=initial_equity)
+    fee = fee_bps / 10_000.0
     cash = initial_equity
     open_trade: Optional[Trade] = None
     stop_price = 0.0
@@ -162,23 +165,25 @@ def run_backtest(candles: List[BTCandle], cfg, symbol: str,
         window = [c.as_dict() for c in candles[: i + 1]]
 
         if open_trade is not None:
-            # 1) Trailing-stop ratchet using this bar's high.
+            # 1) Stop hit intrabar? Checked against the stop as it stood
+            #    BEFORE this bar to avoid intrabar look-ahead.
+            if bar.low <= stop_price:
+                open_trade.exit_time = bar.timestamp
+                open_trade.exit_price = stop_price
+                open_trade.reason_exit = "stop_hit"
+                cash += open_trade.qty * stop_price * (1.0 - fee)
+                result.trades.append(open_trade)
+                open_trade = None
+                result.equity_curve.append(cash)
+                continue
+
+            # 2) Trailing-stop ratchet using this bar's high — effective
+            #    from the NEXT bar onward.
             high_water = max(high_water, bar.high)
             if should_activate_trail(open_trade.entry_price, high_water,
                                      cfg.trail_activate_pct):
                 trail = trailing_stop_price(high_water, cfg.trail_pct)
                 stop_price = max(stop_price, trail)
-
-            # 2) Stop hit intrabar?
-            if bar.low <= stop_price:
-                open_trade.exit_time = bar.timestamp
-                open_trade.exit_price = stop_price
-                open_trade.reason_exit = "stop_hit"
-                cash += open_trade.qty * stop_price
-                result.trades.append(open_trade)
-                open_trade = None
-                result.equity_curve.append(cash)
-                continue
 
             # 3) Signal-based exit on close.
             sig = generate_signal(
@@ -189,7 +194,7 @@ def run_backtest(candles: List[BTCandle], cfg, symbol: str,
                 open_trade.exit_time = bar.timestamp
                 open_trade.exit_price = bar.close
                 open_trade.reason_exit = sig.reason
-                cash += open_trade.qty * bar.close
+                cash += open_trade.qty * bar.close * (1.0 - fee)
                 result.trades.append(open_trade)
                 open_trade = None
             result.equity_curve.append(
@@ -210,7 +215,7 @@ def run_backtest(candles: List[BTCandle], cfg, symbol: str,
             qty = min(qty, max_qty)
             if qty > 0:
                 high_water = entry
-                cash -= qty * entry
+                cash -= qty * entry * (1.0 + fee)
                 open_trade = Trade(symbol=symbol, entry_time=bar.timestamp,
                                    entry_price=entry, qty=qty)
         result.equity_curve.append(
@@ -231,7 +236,8 @@ def run_backtest(candles: List[BTCandle], cfg, symbol: str,
     return result
 
 
-def print_report(result: BacktestResult, days: int) -> None:
+def print_report(result: BacktestResult, days: int,
+                 fee_bps: float = 0.0) -> None:
     r = result
     bh = r.buy_hold_return
     strat_ret = r.total_return
@@ -260,6 +266,12 @@ def print_report(result: BacktestResult, days: int) -> None:
     if strat_ret < bh:
         print("  NOTE: the strategy did NOT beat simply holding over this")
         print("  window. Momentum systems lag in trending/choppy regimes.")
+    if fee_bps > 0:
+        print(f"  Fees modeled at {fee_bps:.0f} bps per side. Slippage is NOT")
+        print("  modeled; real results will be somewhat worse.")
+    else:
+        print("  Fees/slippage NOT modeled (use --fee-bps 25 for Alpaca's")
+        print("  taker fee); real results will be worse.")
     print(f"{line}\n")
 
 
@@ -268,6 +280,8 @@ def main() -> None:
     parser.add_argument("--symbol", default="BTC/USD")
     parser.add_argument("--days", type=int, default=180)
     parser.add_argument("--cash", type=float, default=10_000.0)
+    parser.add_argument("--fee-bps", type=float, default=0.0,
+                        help="fee per side in basis points (Alpaca taker ~25)")
     args = parser.parse_args()
 
     cfg = config_module.load_config()
@@ -279,9 +293,10 @@ def main() -> None:
         return
     print(f"Fetched {len(candles)} candles for {args.symbol} "
           f"({candles[0].timestamp:%Y-%m-%d} → {candles[-1].timestamp:%Y-%m-%d})")
-    result = run_backtest(candles, cfg, args.symbol, args.cash)
+    result = run_backtest(candles, cfg, args.symbol, args.cash,
+                          fee_bps=args.fee_bps)
     result.days = args.days
-    print_report(result, args.days)
+    print_report(result, args.days, fee_bps=args.fee_bps)
 
 
 if __name__ == "__main__":

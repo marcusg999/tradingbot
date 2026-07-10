@@ -12,7 +12,9 @@ Design:
 """
 from __future__ import annotations
 
+import argparse
 import logging
+import os
 import signal
 import time
 from datetime import datetime, timedelta, timezone
@@ -29,7 +31,8 @@ from strategy import Signal, generate_signal
 
 
 class Engine:
-    def __init__(self) -> None:
+    def __init__(self, reset_kill_switch: bool = False) -> None:
+        self._reset_kill_switch = reset_kill_switch
         self.c = config_module.load_config()
         self.log = get_logger("momentum-bot", self.c.log_level, self.c.log_json)
         self.notifier = Notifier(self.c, self.log)
@@ -218,26 +221,78 @@ class Engine:
     def _current_exposure(self, positions: Dict[str, PositionInfo]) -> float:
         return sum(abs(p.market_value) for p in positions.values())
 
+    def _sync_closed_positions(self, positions: Dict[str, PositionInfo]) -> None:
+        """Book tracked positions that no longer exist at Alpaca.
+
+        A server-side stop that fills between cycles closes the position
+        without the bot's involvement; without this the exit never reaches
+        the trade ledger. The 120s grace period avoids false positives from
+        the positions endpoint lagging a just-filled entry.
+        """
+        for sym, rec in self.state.all_positions().items():
+            if sym in positions:
+                continue
+            try:
+                opened = datetime.fromisoformat(rec.opened_at)
+                age = (datetime.now(timezone.utc) - opened).total_seconds()
+                if age < 120:
+                    continue
+            except ValueError:
+                pass
+            self.log.warning("%s closed at Alpaca (stop fill) — booking exit "
+                             "at ~%.6g", sym, rec.stop_price)
+            pnl = (rec.stop_price - rec.entry_price) * rec.qty
+            self.state.record_trade(
+                symbol=sym, side="SELL", qty=rec.qty, entry=rec.entry_price,
+                exit=rec.stop_price, stop=rec.stop_price, pnl=pnl,
+                reason_entry="", reason_exit="stop_filled")
+            self.state.delete_position(sym)
+            emoji = "🟢" if pnl >= 0 else "🔴"
+            self.notifier.send(f"{emoji} Stop filled",
+                               f"{sym} @ ~{rec.stop_price:.6g} | "
+                               f"P&L ~{pnl:+.2f}")
+
+    def _check_stop_gap(self, symbol: str, current_price: float) -> None:
+        """Force a market exit if price gapped through an unfilled stop-limit.
+
+        A stop_limit protects against normal moves, but a violent drop can
+        blow through the limit band and leave the order resting unfilled
+        while the position keeps losing.
+        """
+        rec = self.state.get_position(symbol)
+        if rec is None or current_price <= 0:
+            return
+        gap_floor = rec.stop_price * (1.0 - 2 * Broker.STOP_LIMIT_SLIPPAGE)
+        if current_price >= gap_floor:
+            return
+        self.log.critical("%s price %.6g gapped below stop %.6g — forcing "
+                          "market exit", symbol, current_price, rec.stop_price)
+        self.exit(symbol, current_price, "stop_gap_forced_exit")
+
     def enter(self, symbol: str, price: float, equity: float,
-              exposure: float, data_age: float, reason: str) -> None:
+              exposure: float, data_age: float, reason: str) -> float:
+        """Attempt an entry. Returns the notional actually deployed (0.0 if
+        rejected or failed) so the caller can keep its exposure total live."""
         plan = self.risk.plan_entry(equity, price, exposure, data_age)
         if not plan.accepted:
             log_event(self.log, logging.INFO, "entry rejected", symbol=symbol,
                       reason=plan.reason, price=price, equity=equity)
-            return
+            return 0.0
         self.log.info("ENTER %s qty=%.8f @~%.2f stop=%.2f (%s)", symbol,
                       plan.qty, price, plan.stop_price, reason)
         try:
             order = self.broker.submit_market_buy(symbol, plan.qty)
         except Exception as exc:
             self.log.error("market buy failed %s: %s", symbol, exc)
-            return
-        fill_price = self._wait_fill(order) or price
+            return 0.0
+        avg_price, filled_qty = self._wait_fill(order)
+        fill_price = avg_price or price
+        qty = filled_qty or plan.qty
         # Recompute the stop off the actual fill.
         stop = self.risk.hard_stop(fill_price)
         stop_order_id = None
         try:
-            stop_order = self.broker.submit_stop_sell(symbol, plan.qty, stop)
+            stop_order = self.broker.submit_stop_sell(symbol, qty, stop)
             stop_order_id = getattr(stop_order, "id", None)
         except Exception as exc:  # pragma: no cover
             self.log.error("stop submit failed %s: %s — closing to stay flat",
@@ -246,19 +301,20 @@ class Engine:
                 self.broker.close_position(symbol)
             except Exception:
                 pass
-            return
+            return 0.0
         rec = PositionRecord(
-            symbol=symbol, qty=plan.qty, entry_price=fill_price,
+            symbol=symbol, qty=qty, entry_price=fill_price,
             stop_price=stop, stop_order_id=stop_order_id,
             high_water_mark=fill_price, trail_active=False,
             opened_at=datetime.now(timezone.utc).isoformat())
         self.state.upsert_position(rec)
         self.state.record_trade(
-            symbol=symbol, side="BUY", qty=plan.qty, entry=fill_price,
+            symbol=symbol, side="BUY", qty=qty, entry=fill_price,
             exit=None, stop=stop, pnl=None, reason_entry=reason, reason_exit="")
         self.notifier.send("🟢 Opened position",
-                           f"{symbol} {plan.qty:.6f} @ {fill_price:.2f}\n"
+                           f"{symbol} {qty:.6f} @ {fill_price:.2f}\n"
                            f"stop {stop:.2f} | {reason}")
+        return qty * fill_price
 
     def exit(self, symbol: str, price: float, reason: str) -> None:
         rec = self.state.get_position(symbol)
@@ -268,11 +324,27 @@ class Engine:
         if rec.stop_order_id:
             self.broker.cancel_order(rec.stop_order_id)
         try:
-            self.broker.close_position(symbol)
+            close_order = self.broker.close_position(symbol)
         except Exception as exc:
-            self.log.error("close_position failed %s: %s", symbol, exc)
+            # The stop was already cancelled; the position must not be left
+            # naked. Re-arm the stop at its previous level before bailing.
+            self.log.error("close_position failed %s: %s — re-arming stop",
+                           symbol, exc)
+            try:
+                order = self.broker.submit_stop_sell(symbol, rec.qty,
+                                                     rec.stop_price)
+                rec.stop_order_id = getattr(order, "id", None)
+                self.state.upsert_position(rec)
+            except Exception:
+                self.log.critical("UNPROTECTED POSITION %s — exit failed and "
+                                  "stop re-arm failed; manual action required",
+                                  symbol)
+                self.notifier.send("⚠️ UNPROTECTED POSITION",
+                                   f"{symbol}: exit failed and stop could not "
+                                   f"be re-armed. Intervene manually.")
             return
-        exit_price = price
+        fill_price, _ = self._wait_fill(close_order)
+        exit_price = fill_price or price
         pnl = (exit_price - rec.entry_price) * rec.qty
         self.state.record_trade(
             symbol=symbol, side="SELL", qty=rec.qty, entry=rec.entry_price,
@@ -283,11 +355,12 @@ class Engine:
         self.notifier.send(f"{emoji} Closed position",
                            f"{symbol} @ {exit_price:.2f} | P&L {pnl:+.2f} | {reason}")
 
-    def _wait_fill(self, order, attempts: int = 5, delay: float = 1.0) -> Optional[float]:
-        """Poll an order for its average fill price. Best-effort."""
+    def _wait_fill(self, order, attempts: int = 5,
+                   delay: float = 1.0) -> Tuple[Optional[float], Optional[float]]:
+        """Poll an order for (avg_fill_price, filled_qty). Best-effort."""
         oid = getattr(order, "id", None)
         if oid is None:
-            return None
+            return None, None
         for _ in range(attempts):
             try:
                 fresh = self.broker.trading.get_order_by_id(oid)
@@ -295,9 +368,10 @@ class Engine:
                 break
             avg = getattr(fresh, "filled_avg_price", None)
             if avg:
-                return float(avg)
+                fq = getattr(fresh, "filled_qty", None)
+                return float(avg), (float(fq) if fq else None)
             time.sleep(delay)
-        return None
+        return None, None
 
     # ------------------------------------------------------------------
     # Main loop
@@ -308,17 +382,22 @@ class Engine:
 
         if self.check_kill_switch(day_start, equity):
             self.log.critical("TRADING HALTED (kill switch). Reason: %s. "
-                              "Manual restart required.",
+                              "Restart with --reset-kill-switch (or "
+                              "RESET_KILL_SWITCH=yes) to resume.",
                               self.state.kill_switch_reason())
             return
 
         positions = self.broker.list_positions()
+        self._sync_closed_positions(positions)
         exposure = self._current_exposure(positions)
         unrealized = sum(p.unrealized_pl for p in positions.values())
 
         for symbol in self.c.symbols:
             try:
-                self._process_symbol(symbol, equity, positions, exposure)
+                # Accumulate notional deployed this cycle so a later symbol's
+                # entry is checked against exposure including earlier entries.
+                exposure += self._process_symbol(symbol, equity, positions,
+                                                 exposure)
             except Exception as exc:  # pragma: no cover - never kill the loop
                 self.log.exception("error processing %s: %s", symbol, exc)
 
@@ -330,26 +409,40 @@ class Engine:
 
     def _process_symbol(self, symbol: str, equity: float,
                         positions: Dict[str, PositionInfo],
-                        exposure: float) -> None:
+                        exposure: float) -> float:
+        """Returns the notional deployed by an entry this cycle (0.0 if none)."""
         bars = self.broker.get_bars(symbol, self._lookback_start())
         closed, latest = self._split_bars(bars)
         if latest is None or not closed:
             self.log.info("%s: insufficient bar data", symbol)
-            return
+            return 0.0
 
         current_price = latest.close
-        data_age = self.broker.candle_age_seconds(latest)
         norm = normalize_symbol(symbol)
         have_position = norm in positions
 
-        # Fast path: keep the trailing stop current every cycle.
+        # Staleness = time since the newest CLOSED candle finished forming.
+        # (Measuring from the forming bar's open would mark perfectly live
+        # data "stale" from minute 5 of every hour.)
+        interval = timedelta(hours=self.c.timeframe_hours)
+        last_closed_ts = closed[-1].timestamp
+        close_time = last_closed_ts
+        if close_time.tzinfo is None:
+            close_time = close_time.replace(tzinfo=timezone.utc)
+        data_age = max(0.0, (datetime.now(timezone.utc) -
+                             (close_time + interval)).total_seconds())
+
+        # Fast path every cycle: trailing-stop ratchet, then verify a live
+        # server-side stop actually exists (heals any failed cancel/replace),
+        # then force out if price gapped through an unfilled stop-limit.
         if have_position:
             self.manage_trailing_stop(norm, current_price)
+            self._ensure_stop_order(norm)
+            self._check_stop_gap(norm, current_price)
 
         # Strategy path: only on a freshly closed candle.
-        last_closed_ts = closed[-1].timestamp
         if self._last_candle_ts.get(symbol) == last_closed_ts:
-            return
+            return 0.0
         self._last_candle_ts[symbol] = last_closed_ts
 
         candle_dicts = [c.as_dict() for c in closed]
@@ -370,15 +463,22 @@ class Engine:
             if data_age > self.c.max_data_staleness_sec:
                 self.log.warning("%s: skip entry, stale data %.0fs", symbol,
                                  data_age)
-                return
-            self.enter(symbol, current_price, equity, exposure, data_age,
-                       result.reason)
+                return 0.0
+            return self.enter(symbol, current_price, equity, exposure,
+                              data_age, result.reason)
         elif result.signal == Signal.EXIT_LONG and have_position:
             self.exit(norm, current_price, result.reason)
+        return 0.0
 
     def run(self) -> None:
         if not self._ready:
             return
+        if self._reset_kill_switch and self.state.is_kill_switch_active():
+            self.log.warning("KILL SWITCH MANUALLY RESET (was: %s). If you "
+                             "set RESET_KILL_SWITCH=yes, unset it now so a "
+                             "future halt isn't silently cleared on restart.",
+                             self.state.kill_switch_reason())
+            self.state.set_kill_switch(False, "manual_reset")
         self.install_signal_handlers()
         try:
             self.reconcile()
@@ -407,7 +507,15 @@ class Engine:
 
 
 def main() -> None:
-    Engine().run()
+    parser = argparse.ArgumentParser(description="momentum-bot trading loop")
+    parser.add_argument(
+        "--reset-kill-switch", action="store_true",
+        help="clear a persisted kill-switch halt, then start trading")
+    args = parser.parse_args()
+    reset = args.reset_kill_switch or (
+        os.environ.get("RESET_KILL_SWITCH", "").strip().lower()
+        in {"1", "true", "yes"})
+    Engine(reset_kill_switch=reset).run()
 
 
 if __name__ == "__main__":

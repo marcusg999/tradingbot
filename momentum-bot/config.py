@@ -49,6 +49,22 @@ def _get_list(name: str, default: List[str]) -> List[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def normalize_symbol(symbol: str) -> str:
+    """Canonical 'BASE/QUOTE' crypto pair form.
+
+    The data API requires the slash form; position endpoints return the
+    collapsed form. Normalizing here means a user setting SYMBOLS=BTCUSD
+    still gets working candle requests.
+    """
+    s = symbol.upper().strip()
+    if "/" in s:
+        return s
+    for quote in ("USDT", "USDC", "USD"):
+        if s.endswith(quote) and len(s) > len(quote):
+            return f"{s[:-len(quote)]}/{quote}"
+    return s
+
+
 @dataclass(frozen=True)
 class Config:
     # --- Alpaca credentials & endpoint -------------------------------------
@@ -115,6 +131,13 @@ def _resolve_live_mode(trading_mode_raw: str, understand_raw: str) -> bool:
 
 
 def load_config() -> Config:
+    # Load a local .env if python-dotenv is installed; real env vars win.
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass
+
     trading_mode_raw = _get_str("TRADING_MODE", "paper")
     understand_raw = _get_str("I_UNDERSTAND_REAL_MONEY", "no")
     live = _resolve_live_mode(trading_mode_raw, understand_raw)
@@ -125,7 +148,8 @@ def load_config() -> Config:
         live=live,
         trading_mode_raw=trading_mode_raw,
         understand_real_money_raw=understand_raw,
-        symbols=_get_list("SYMBOLS", ["BTC/USD", "ETH/USD"]),
+        symbols=[normalize_symbol(s)
+                 for s in _get_list("SYMBOLS", ["BTC/USD", "ETH/USD"])],
         timeframe_hours=_get_int("TIMEFRAME_HOURS", 1),
         ema_fast=_get_int("EMA_FAST", 20),
         ema_slow=_get_int("EMA_SLOW", 50),
