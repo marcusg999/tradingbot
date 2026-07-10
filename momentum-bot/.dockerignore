@@ -1,0 +1,23 @@
+# Never bake secrets or local state into the image.
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+trades.csv
+
+.git
+.gitignore
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.mypy_cache/
+.coverage
+htmlcov/
+tests/
+.DS_Store
+.idea/
+.vscode/
