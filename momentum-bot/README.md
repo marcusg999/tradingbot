@@ -339,7 +339,7 @@ numbers are illustrative — run it yourself for real ones):
 
 ---
 
-## 5. Deployment (Docker / Railway)
+## 5. Deployment (Docker / Railway / Render)
 
 ### Docker (any host)
 
@@ -377,6 +377,35 @@ and ledgers out of the image itself.
 > To reset a kill-switch halt on Railway: set `RESET_KILL_SWITCH=yes`, let it
 > redeploy once, then **remove the variable** so a future halt isn't silently
 > cleared by the next restart.
+
+### Render (Blueprint)
+
+A `render.yaml` Blueprint lives at the **repo root** (it points `rootDir` at
+`momentum-bot/`). It defines a background worker built from the `Dockerfile`
+with a 1 GB persistent disk at `/app/data` and the state paths pre-wired.
+
+1. Push this repo to GitHub.
+2. In [Render](https://render.com/): **New → Blueprint** → pick this repo.
+   Render reads `render.yaml` and provisions the worker + disk.
+3. Set the secret env vars it prompts for (`ALPACA_API_KEY`,
+   `ALPACA_API_SECRET`, optionally `DISCORD_WEBHOOK_URL`). The safety-gate and
+   state-path vars are already set to safe defaults in the Blueprint.
+4. Deploy. On redeploy Render sends `SIGTERM`; the bot persists state and exits
+   cleanly, leaving stops live at Alpaca.
+
+> **Note:** Render background workers and persistent disks are **paid**
+> (~$7/mo starter) — there is no free worker tier. The disk is what keeps
+> `state.db` / `trades.csv` and kill-switch status across redeploys.
+>
+> **Netlify won't work** for the bot: it only runs static sites and
+> short-lived serverless functions, with no always-on process or persistent
+> disk. Keep Netlify for frontends; run the bot on Render/Railway/Fly/a VPS.
+>
+> **Dashboard on Render:** a Render disk attaches to one service only, so the
+> read-only dashboard (which reads the same `state.db`) can't run as a second
+> Render service against it. Rely on logs + Discord/Telegram there, or run the
+> dashboard on a single host that shares the volume (a VPS, or a Fly machine
+> running both processes).
 
 ---
 
