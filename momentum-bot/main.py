@@ -290,27 +290,49 @@ class Engine:
         qty = filled_qty or plan.qty
         # Recompute the stop off the actual fill.
         stop = self.risk.hard_stop(fill_price)
-        stop_order_id = None
-        try:
-            stop_order = self.broker.submit_stop_sell(symbol, qty, stop)
-            stop_order_id = getattr(stop_order, "id", None)
-        except Exception as exc:  # pragma: no cover
-            self.log.error("stop submit failed %s: %s — closing to stay flat",
-                           symbol, exc)
-            try:
-                self.broker.close_position(symbol)
-            except Exception:
-                pass
-            return 0.0
+
+        # Persist the position BEFORE attempting the stop. If the stop submit
+        # then fails, the position is already tracked, so the per-cycle
+        # _ensure_stop_order will re-arm it — it never ends up untracked and
+        # unprotected.
         rec = PositionRecord(
             symbol=symbol, qty=qty, entry_price=fill_price,
-            stop_price=stop, stop_order_id=stop_order_id,
+            stop_price=stop, stop_order_id=None,
             high_water_mark=fill_price, trail_active=False,
             opened_at=datetime.now(timezone.utc).isoformat())
         self.state.upsert_position(rec)
         self.state.record_trade(
             symbol=symbol, side="BUY", qty=qty, entry=fill_price,
             exit=None, stop=stop, pnl=None, reason_entry=reason, reason_exit="")
+
+        try:
+            stop_order = self.broker.submit_stop_sell(symbol, qty, stop)
+            rec.stop_order_id = getattr(stop_order, "id", None)
+            self.state.upsert_position(rec)
+        except Exception as exc:  # pragma: no cover
+            self.log.error("stop submit failed %s: %s — trying to close to "
+                           "stay flat", symbol, exc)
+            try:
+                self.broker.close_position(symbol)
+                # Close succeeded: book the immediate unwind and untrack.
+                pnl = (fill_price - rec.entry_price) * qty
+                self.state.record_trade(
+                    symbol=symbol, side="SELL", qty=qty, entry=fill_price,
+                    exit=fill_price, stop=stop, pnl=pnl, reason_entry="",
+                    reason_exit="stop_submit_failed_closed")
+                self.state.delete_position(symbol)
+                return 0.0
+            except Exception:
+                # Both failed: position stays tracked and _ensure_stop_order
+                # will re-arm the stop next cycle. Alert loudly meanwhile.
+                self.log.critical("UNPROTECTED POSITION %s — stop submit and "
+                                  "close both failed; will retry stop next "
+                                  "cycle", symbol)
+                self.notifier.send("⚠️ UNPROTECTED POSITION",
+                                   f"{symbol}: stop failed on entry; retrying "
+                                   f"each cycle. Intervene if it persists.")
+                return qty * fill_price
+
         self.notifier.send("🟢 Opened position",
                            f"{symbol} {qty:.6f} @ {fill_price:.2f}\n"
                            f"stop {stop:.2f} | {reason}")

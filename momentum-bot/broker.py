@@ -165,9 +165,29 @@ class Broker:
     def cancel_all_orders(self) -> None:
         self.trading.cancel_orders()
 
+    def _resolve_asset_id(self, symbol: str):
+        """Return the Alpaca asset-id (UUID) for an open position, or None.
+
+        Closing/identifying a position by asset-id is unambiguous; closing by
+        crypto symbol depends on the exact form Alpaca's path-param endpoint
+        expects (BTC/USD vs BTCUSD), which varies. Prefer the UUID.
+        """
+        norm = normalize_symbol(symbol)
+        try:
+            for p in self.trading.get_all_positions():
+                if normalize_symbol(p.symbol) == norm:
+                    return getattr(p, "asset_id", None)
+        except Exception:  # pragma: no cover - network/SDK error
+            return None
+        return None
+
     def close_position(self, symbol: str):
-        # Position endpoints are path-parameter based; a '/' in the symbol
-        # corrupts the URL, so use the collapsed form (BTC/USD -> BTCUSD).
+        # Prefer the asset-id UUID (unambiguous path param). Fall back to the
+        # collapsed symbol form only if the id can't be resolved — a raw '/'
+        # in the path would corrupt the URL, so never pass the slash form.
+        asset_id = self._resolve_asset_id(symbol)
+        if asset_id is not None:
+            return self.trading.close_position(asset_id)
         return self.trading.close_position(symbol.replace("/", ""))
 
     def close_all_positions(self) -> None:
