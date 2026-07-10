@@ -34,6 +34,19 @@ class _JsonFormatter(logging.Formatter):
         return json.dumps(payload, default=str)
 
 
+class _HumanFormatter(logging.Formatter):
+    """Plain-text formatter that appends structured key=value fields, so the
+    cycle/signal data is visible outside JSON mode too."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        base = super().format(record)
+        extra = getattr(record, "extra_fields", None)
+        if isinstance(extra, dict) and extra:
+            kv = " ".join(f"{k}={v}" for k, v in extra.items())
+            return f"{base} | {kv}"
+        return base
+
+
 _configured_names: set = set()
 
 
@@ -45,7 +58,7 @@ def get_logger(name: str = "momentum-bot", level: str = "INFO",
         if json_output:
             handler.setFormatter(_JsonFormatter())
         else:
-            handler.setFormatter(logging.Formatter(
+            handler.setFormatter(_HumanFormatter(
                 "%(asctime)s %(levelname)-7s %(name)s | %(message)s",
                 datefmt="%Y-%m-%dT%H:%M:%S%z",
             ))
