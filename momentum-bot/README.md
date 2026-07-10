@@ -368,7 +368,7 @@ Everything is an environment variable (or a `.env` line). Defaults are safe.
 | `ALPACA_API_KEY` / `ALPACA_API_SECRET` | — | Your Alpaca keys (paper keys for paper mode) |
 | `TRADING_MODE` | `paper` | Must be `live` **and** the flag below set to trade real money |
 | `I_UNDERSTAND_REAL_MONEY` | `no` | Second half of the live-mode gate; must be `yes` |
-| `SYMBOLS` | `BTC/USD,ETH/USD` | Comma-separated pairs; `BTCUSD` form is auto-normalized |
+| `SYMBOLS` | 10 liquid pairs (BTC, ETH, SOL, DOGE, LTC, LINK, AVAX, UNI, AAVE, DOT) | Comma-separated Alpaca crypto pairs; `BTCUSD` form is auto-normalized. See `.env.example` for the wider list of listed pairs |
 | `TIMEFRAME_HOURS` | `1` | Candle size in hours |
 | `EMA_FAST` / `EMA_SLOW` | `20` / `50` | Crossover periods |
 | `RSI_PERIOD` | `14` | RSI lookback |

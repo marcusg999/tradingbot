@@ -14,9 +14,14 @@ def reload_config(monkeypatch, env):
 
 def test_defaults_to_paper(monkeypatch):
     c = reload_config(monkeypatch, {
-        "TRADING_MODE": None, "I_UNDERSTAND_REAL_MONEY": None})
+        "TRADING_MODE": None, "I_UNDERSTAND_REAL_MONEY": None,
+        "SYMBOLS": None})
     assert c.live is False and c.paper is True
-    assert c.symbols == ["BTC/USD", "ETH/USD"]
+    # Default universe: BTC/ETH lead, all normalized to slash form.
+    assert c.symbols == config_module.DEFAULT_SYMBOLS
+    assert c.symbols[:2] == ["BTC/USD", "ETH/USD"]
+    assert all("/USD" in s for s in c.symbols)
+    assert len(c.symbols) == len(set(c.symbols))  # no dupes
 
 
 def test_live_requires_both_flags(monkeypatch):

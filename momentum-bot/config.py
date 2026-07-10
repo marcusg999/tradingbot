@@ -49,6 +49,26 @@ def _get_list(name: str, default: List[str]) -> List[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+# Curated default universe: liquid, long-established USD crypto pairs that
+# Alpaca lists. Override entirely with the SYMBOLS env var. Note the risk caps
+# are account-wide (50% max exposure, ~25% per position), so a longer list
+# widens the opportunity set without adding total risk — only ~2 positions can
+# be open at once regardless of how many symbols are watched.
+DEFAULT_SYMBOLS = [
+    "BTC/USD", "ETH/USD", "SOL/USD", "DOGE/USD", "LTC/USD",
+    "LINK/USD", "AVAX/USD", "UNI/USD", "AAVE/USD", "DOT/USD",
+]
+
+# Broader set of USD pairs Alpaca has listed, for reference when customizing
+# SYMBOLS. Confirm availability in your Alpaca dashboard before relying on one;
+# listings change, and thin alts whipsaw the EMA strategy harder — backtest
+# each before adding it.
+KNOWN_ALPACA_CRYPTO_USD = DEFAULT_SYMBOLS + [
+    "BCH/USD", "XRP/USD", "SHIB/USD", "MKR/USD", "CRV/USD",
+    "GRT/USD", "SUSHI/USD", "YFI/USD", "XTZ/USD", "BAT/USD",
+]
+
+
 def normalize_symbol(symbol: str) -> str:
     """Canonical 'BASE/QUOTE' crypto pair form.
 
@@ -149,7 +169,7 @@ def load_config() -> Config:
         trading_mode_raw=trading_mode_raw,
         understand_real_money_raw=understand_raw,
         symbols=[normalize_symbol(s)
-                 for s in _get_list("SYMBOLS", ["BTC/USD", "ETH/USD"])],
+                 for s in _get_list("SYMBOLS", DEFAULT_SYMBOLS)],
         timeframe_hours=_get_int("TIMEFRAME_HOURS", 1),
         ema_fast=_get_int("EMA_FAST", 20),
         ema_slow=_get_int("EMA_SLOW", 50),
