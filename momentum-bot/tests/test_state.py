@@ -2,6 +2,7 @@ import os
 
 import pytest
 
+import state as state_module
 from state import PositionRecord, State
 
 
@@ -60,6 +61,33 @@ def test_position_crud(store):
     assert "BTC/USD" in store.all_positions()
     store.delete_position("BTC/USD")
     assert store.get_position("BTC/USD") is None
+
+
+def test_equity_history_record_and_read(store):
+    for i in range(5):
+        store.record_equity(10_000 + i)
+    hist = store.equity_history()
+    assert len(hist) == 5
+    assert hist[0][1] == 10_000 and hist[-1][1] == 10_004
+    # Each entry is (timestamp, equity).
+    assert isinstance(hist[0][0], str) and isinstance(hist[0][1], float)
+
+
+def test_equity_history_limit(store):
+    for i in range(10):
+        store.record_equity(100 + i)
+    assert len(store.equity_history(limit=3)) == 3
+    assert store.equity_history(limit=3)[-1][1] == 109
+
+
+def test_equity_history_prunes_to_cap(store, monkeypatch):
+    monkeypatch.setattr(state_module, "MAX_EQUITY_POINTS", 4)
+    for i in range(10):
+        store.record_equity(float(i))
+    hist = store.equity_history()
+    # Bounded to ~MAX_EQUITY_POINTS most-recent rows.
+    assert len(hist) <= 5
+    assert hist[-1][1] == 9.0  # newest retained
 
 
 def test_trade_ledger_writes_csv(store, tmp_path):

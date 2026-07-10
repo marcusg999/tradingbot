@@ -223,6 +223,38 @@ timestamp,symbol,side,qty,entry,exit,stop,pnl,reason_entry,reason_exit
 
 The same ledger is kept in SQLite (`state.db`, table `trades`) for querying.
 
+### Optional: read-only web dashboard
+
+A separate, **read-only** process shows what the bot is doing in a browser —
+an **equity/P&L curve**, current equity, open positions, live unrealized P&L,
+kill-switch status, and the recent trade ledger. It opens the state file in
+read-only mode and has **no** endpoints that place, cancel, or modify orders
+(mutating HTTP methods return `405`).
+
+```bash
+python dashboard.py          # serves on http://0.0.0.0:8080
+# then open http://localhost:8080
+```
+
+![Read-only dashboard](docs/dashboard.png)
+
+*(Equity / Exposure / Current / Unrealized show `—` when Alpaca isn't
+connected; they populate with live data once keys are set.)*
+
+- Auto-refreshes every 15s. Endpoints: `/` (HTML), `/api/snapshot` (JSON),
+  `/healthz`.
+- Reads `state.db` + `trades.csv`. If Alpaca keys are set (and
+  `DASHBOARD_LIVE` isn't `false`) it also shows **live** equity and unrealized
+  P&L; otherwise it degrades to local state only.
+- The **equity chart** is an inline SVG (no JS/CDN) drawn from an
+  equity-history table the bot appends to each cycle, with a dashed day-start
+  baseline so intraday P&L is obvious at a glance.
+- Config: `DASHBOARD_PORT` (default `8080`), `DASHBOARD_HOST` (default
+  `0.0.0.0`), `DASHBOARD_LIVE` (default `true`).
+- Zero extra dependencies — built on Python's stdlib `http.server`.
+- Runs as its own service. Point it at the same state file as the bot (share a
+  volume in Docker/Railway, e.g. `STATE_DB_PATH=/app/data/state.db`).
+
 ### Optional: trade notifications on your phone
 
 Set one of these in `.env` and the bot pings you on every entry, exit,
@@ -385,6 +417,8 @@ Everything is an environment variable (or a `.env` line). Defaults are safe.
 | `POLL_INTERVAL_SEC` | `60` | Stop/kill-switch check cadence |
 | `STATE_DB_PATH` / `TRADES_CSV_PATH` | `state.db` / `trades.csv` | Where state and the ledger live |
 | `RESET_KILL_SWITCH` | — | Set to `yes` for one boot to clear a halt, then unset |
+| `DASHBOARD_PORT` / `DASHBOARD_HOST` | `8080` / `0.0.0.0` | Read-only dashboard bind address |
+| `DASHBOARD_LIVE` | `true` | Let the dashboard read live Alpaca equity/P&L; `false` = local state only |
 | `DISCORD_WEBHOOK_URL` | — | Optional trade/alert notifications |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | Optional Telegram notifications |
 | `LOG_LEVEL` / `LOG_JSON` | `INFO` / `false` | Verbosity; `LOG_JSON=true` for structured JSON logs |

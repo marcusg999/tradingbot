@@ -1,6 +1,8 @@
+import types
+
 import pytest
 
-from broker import round_price
+from broker import Broker, round_price
 from config import normalize_symbol
 
 
@@ -31,3 +33,42 @@ def test_round_price_subdollar_keeps_precision():
     # SHIB-scale must not collapse to zero.
     assert round_price(0.0000234567) == pytest.approx(2.34567e-05)
     assert round_price(0.0000234567) > 0
+
+
+class _FakePos:
+    def __init__(self, symbol, asset_id):
+        self.symbol = symbol
+        self.asset_id = asset_id
+
+
+def _broker_with_positions(positions, closed_calls):
+    b = Broker.__new__(Broker)  # skip __init__ (no network)
+    b.trading = types.SimpleNamespace(
+        get_all_positions=lambda: positions,
+        close_position=lambda ident: closed_calls.append(ident) or "ok")
+    return b
+
+
+def test_close_position_prefers_asset_id():
+    # Alpaca returns crypto positions in slash form; we match and close by the
+    # unambiguous asset-id UUID rather than by symbol.
+    calls = []
+    b = _broker_with_positions([_FakePos("BTC/USD", "uuid-btc")], calls)
+    b.close_position("BTC/USD")
+    assert calls == ["uuid-btc"]
+
+
+def test_close_position_matches_collapsed_symbol_form():
+    calls = []
+    b = _broker_with_positions([_FakePos("BTCUSD", "uuid-btc")], calls)
+    b.close_position("BTC/USD")   # normalizes both sides before matching
+    assert calls == ["uuid-btc"]
+
+
+def test_close_position_falls_back_to_stripped_symbol():
+    # No matching position found -> fall back to the collapsed symbol, never
+    # the slash form (which would corrupt the URL path).
+    calls = []
+    b = _broker_with_positions([], calls)
+    b.close_position("BTC/USD")
+    assert calls == ["BTCUSD"]
