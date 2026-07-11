@@ -1,0 +1,48 @@
+# Render Blueprint for momentum-bot.
+# https://render.com/docs/blueprint-spec
+#
+# Render auto-detects this file at the repository ROOT. The bot itself lives in
+# the momentum-bot/ subdirectory, so rootDir points the Docker build there.
+#
+# The bot is a long-running BACKGROUND WORKER (no HTTP port). Note: Render
+# background workers and persistent disks require a paid instance type (there
+# is no free worker tier) — the disk is what keeps state.db / trades.csv (and
+# the kill-switch status) across redeploys, so it is worth it.
+#
+# Deploy: push to GitHub → Render dashboard → New → Blueprint → pick this repo.
+# Then set the secret env vars (marked sync:false) in the dashboard. It runs on
+# PAPER by default; going live still requires flipping BOTH gate vars below.
+
+services:
+  - type: worker
+    name: momentum-bot
+    runtime: docker
+    rootDir: momentum-bot
+    dockerfilePath: ./Dockerfile
+    plan: starter
+    autoDeploy: true
+    # Persistent disk so bot state survives redeploys/restarts.
+    disk:
+      name: momentum-bot-data
+      mountPath: /app/data
+      sizeGB: 1
+    envVars:
+      # --- Secrets: set these in the Render dashboard, never in git ---------
+      - key: ALPACA_API_KEY
+        sync: false
+      - key: ALPACA_API_SECRET
+        sync: false
+      # Optional trade/kill-switch notifications (leave unset to disable):
+      - key: DISCORD_WEBHOOK_URL
+        sync: false
+      # --- Safety gate: PAPER by default. To go live, set TRADING_MODE=live
+      #     AND I_UNDERSTAND_REAL_MONEY=yes (only after weeks of paper). ------
+      - key: TRADING_MODE
+        value: paper
+      - key: I_UNDERSTAND_REAL_MONEY
+        value: "no"
+      # --- Persist state on the mounted disk -------------------------------
+      - key: STATE_DB_PATH
+        value: /app/data/state.db
+      - key: TRADES_CSV_PATH
+        value: /app/data/trades.csv
