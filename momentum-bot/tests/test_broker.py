@@ -2,8 +2,28 @@ import types
 
 import pytest
 
-from broker import Broker, round_price
+from broker import Broker, floor_qty, round_price
 from config import normalize_symbol
+
+
+def test_floor_qty_never_rounds_up():
+    # The classic bug: round(0.7306202966318405, 9) rounds UP to 0.730620297,
+    # which exceeds holdings and gets the sell/stop rejected. floor_qty must
+    # round DOWN so the quantity never exceeds what's held.
+    q = 0.7306202966318405
+    assert floor_qty(q) <= q
+    assert floor_qty(q) == 0.730620296
+    assert round(q, 9) > q            # demonstrates the hazard we avoid
+
+
+def test_floor_qty_zero_and_negative():
+    assert floor_qty(0.0) == 0.0
+    assert floor_qty(-1.0) == 0.0
+
+
+def test_floor_qty_exact_value_unchanged():
+    assert floor_qty(0.5) == 0.5
+    assert floor_qty(1.234567890) == pytest.approx(1.23456789)
 
 
 def test_normalize_slash_form_passthrough():

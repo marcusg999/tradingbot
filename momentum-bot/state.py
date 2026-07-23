@@ -16,11 +16,22 @@ import os
 import sqlite3
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+from decimal import ROUND_HALF_EVEN, Decimal
 from typing import Dict, List, Optional
 
 
 # Retention cap for the equity-history table (~2 days at one sample/minute).
 MAX_EQUITY_POINTS = 3000
+
+_CENT = Decimal("0.01")
+
+
+def quantize_money(value: Optional[float]) -> Optional[float]:
+    """Round a USD amount to whole cents via Decimal so the ledger foots
+    exactly instead of accumulating binary-float error across trades."""
+    if value is None:
+        return None
+    return float(Decimal(str(value)).quantize(_CENT, rounding=ROUND_HALF_EVEN))
 
 
 def _utcnow_iso() -> str:
@@ -200,6 +211,7 @@ class State:
                      stop: Optional[float], pnl: Optional[float],
                      reason_entry: str = "", reason_exit: str = "") -> None:
         ts = _utcnow_iso()
+        pnl = quantize_money(pnl)  # foot the ledger to exact cents
         self.conn.execute("""
             INSERT INTO trades(timestamp, symbol, side, qty, entry, exit,
                 stop, pnl, reason_entry, reason_exit)

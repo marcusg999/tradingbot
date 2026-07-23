@@ -78,6 +78,29 @@ Because stops live **server-side at Alpaca**, a crash, redeploy, or SIGTERM
 never leaves a position unprotected. The bot does **not** auto-close on
 shutdown — positions stay open with their stops in place.
 
+### Financial-correctness safeguards
+
+- **Idempotent orders.** Every submission carries a `client_order_id`: entries
+  use a deterministic per-signal-bar id (a retry or overlapping cycle can't
+  create a duplicate entry — Alpaca dedupes), stops use a fresh id per submit
+  (dedupes an SDK/network retry without blocking a later re-arm).
+- **Quantities are floored, not rounded.** Order/stop sizes are quantized down
+  with `Decimal` so a sell/stop is never for a hair more than is held (which
+  Alpaca would reject, knocking out the stop). Recorded P&L is quantized to
+  cents so the ledger foots.
+- **Atomic stop moves.** The trailing stop is repriced with an in-place order
+  *replace*, not cancel-then-resubmit — no window where the position is
+  unprotected between the two calls.
+- **Stale-data guard on both sides.** Entries *and* exits — including the
+  gap-forced market exit and the trailing ratchet — are skipped when the latest
+  candle is older than `MAX_DATA_STALENESS_SEC`; the server-side stop remains
+  the safety net until fresh data returns.
+- **Single-instance lock.** Startup takes an exclusive file lock, so a second
+  process on the same account refuses to run (two bots would duplicate orders).
+- **Backtest without look-ahead.** Signals detected on a bar's close fill at the
+  *next* bar's open (never the signaling bar's own close); stops are checked
+  intrabar before the trailing ratchet updates.
+
 ### Project layout
 
 ```

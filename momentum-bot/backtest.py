@@ -154,10 +154,39 @@ def run_backtest(candles: List[BTCandle], cfg, symbol: str,
     # Warm-up: need slow EMA + a prior bar before any signal is valid.
     warmup = cfg.ema_slow + 1
 
+    # A signal detected on a bar's close can only be acted on afterwards, so
+    # it executes at the NEXT bar's open — never at the signaling bar's own
+    # close (which would be look-ahead: you can't transact at a price you only
+    # know once the bar has closed). ``pending`` carries the deferred action.
+    pending: Optional[str] = None  # "enter" | "exit" | None
+
     for i in range(len(candles)):
         bar = candles[i]
-        equity = cash + (open_trade.qty * bar.close if open_trade else 0.0)
 
+        # 1) Execute a pending signal at THIS bar's open.
+        if pending == "enter" and open_trade is None:
+            equity = cash
+            entry = bar.open
+            stop_price = hard_stop_price(entry, cfg.hard_stop_pct)
+            qty = position_size(equity, entry, stop_price, cfg.risk_per_trade)
+            max_qty = (equity * min(cfg.max_order_pct, cfg.max_exposure_pct)) / entry
+            qty = min(qty, max_qty)
+            if qty > 0:
+                high_water = entry
+                cash -= qty * entry * (1.0 + fee)
+                open_trade = Trade(symbol=symbol, entry_time=bar.timestamp,
+                                   entry_price=entry, qty=qty)
+            pending = None
+        elif pending == "exit" and open_trade is not None:
+            open_trade.exit_time = bar.timestamp
+            open_trade.exit_price = bar.open
+            open_trade.reason_exit = "ema_cross_down_next_open"
+            cash += open_trade.qty * bar.open * (1.0 - fee)
+            result.trades.append(open_trade)
+            open_trade = None
+            pending = None
+
+        equity = cash + (open_trade.qty * bar.close if open_trade else 0.0)
         if i < warmup:
             result.equity_curve.append(equity)
             continue
@@ -165,8 +194,9 @@ def run_backtest(candles: List[BTCandle], cfg, symbol: str,
         window = [c.as_dict() for c in candles[: i + 1]]
 
         if open_trade is not None:
-            # 1) Stop hit intrabar? Checked against the stop as it stood
-            #    BEFORE this bar to avoid intrabar look-ahead.
+            # 2) Stop hit intrabar? Checked against the stop as it stood BEFORE
+            #    this bar's high ratchets it (no intrabar look-ahead). Stops are
+            #    price-triggered, so they DO fire within the bar (not deferred).
             if bar.low <= stop_price:
                 open_trade.exit_time = bar.timestamp
                 open_trade.exit_price = stop_price
@@ -177,47 +207,29 @@ def run_backtest(candles: List[BTCandle], cfg, symbol: str,
                 result.equity_curve.append(cash)
                 continue
 
-            # 2) Trailing-stop ratchet using this bar's high — effective
-            #    from the NEXT bar onward.
+            # 3) Trailing-stop ratchet using this bar's high — effective next bar.
             high_water = max(high_water, bar.high)
             if should_activate_trail(open_trade.entry_price, high_water,
                                      cfg.trail_activate_pct):
                 trail = trailing_stop_price(high_water, cfg.trail_pct)
                 stop_price = max(stop_price, trail)
 
-            # 3) Signal-based exit on close.
+            # 4) Signal exit → defer to next bar's open.
             sig = generate_signal(
                 window, in_position=True, fast_period=cfg.ema_fast,
                 slow_period=cfg.ema_slow, rsi_period=cfg.rsi_period,
                 rsi_low=cfg.rsi_low, rsi_high=cfg.rsi_high)
             if sig.signal == Signal.EXIT_LONG:
-                open_trade.exit_time = bar.timestamp
-                open_trade.exit_price = bar.close
-                open_trade.reason_exit = sig.reason
-                cash += open_trade.qty * bar.close * (1.0 - fee)
-                result.trades.append(open_trade)
-                open_trade = None
-            result.equity_curve.append(
-                cash + (open_trade.qty * bar.close if open_trade else 0.0))
-            continue
+                pending = "exit"
+        else:
+            # Flat: entry signal → defer to next bar's open.
+            sig = generate_signal(
+                window, in_position=False, fast_period=cfg.ema_fast,
+                slow_period=cfg.ema_slow, rsi_period=cfg.rsi_period,
+                rsi_low=cfg.rsi_low, rsi_high=cfg.rsi_high)
+            if sig.signal == Signal.ENTER_LONG:
+                pending = "enter"
 
-        # Flat: look for an entry.
-        sig = generate_signal(
-            window, in_position=False, fast_period=cfg.ema_fast,
-            slow_period=cfg.ema_slow, rsi_period=cfg.rsi_period,
-            rsi_low=cfg.rsi_low, rsi_high=cfg.rsi_high)
-        if sig.signal == Signal.ENTER_LONG:
-            entry = bar.close
-            stop_price = hard_stop_price(entry, cfg.hard_stop_pct)
-            qty = position_size(equity, entry, stop_price, cfg.risk_per_trade)
-            # Apply the same single-order / exposure caps as live.
-            max_qty = (equity * min(cfg.max_order_pct, cfg.max_exposure_pct)) / entry
-            qty = min(qty, max_qty)
-            if qty > 0:
-                high_water = entry
-                cash -= qty * entry * (1.0 + fee)
-                open_trade = Trade(symbol=symbol, entry_time=bar.timestamp,
-                                   entry_price=entry, qty=qty)
         result.equity_curve.append(
             cash + (open_trade.qty * bar.close if open_trade else 0.0))
 
