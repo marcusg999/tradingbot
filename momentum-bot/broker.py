@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import ROUND_DOWN, Decimal
 from typing import Dict, List, Optional
 
 from alpaca.data.historical import CryptoHistoricalDataClient
@@ -23,10 +24,27 @@ from alpaca.trading.enums import OrderSide, QueryOrderStatus, TimeInForce
 from alpaca.trading.requests import (
     GetOrdersRequest,
     MarketOrderRequest,
+    ReplaceOrderRequest,
     StopLimitOrderRequest,
 )
 
 from config import normalize_symbol
+
+# Alpaca crypto quantity precision.
+QTY_DECIMALS = 9
+
+
+def floor_qty(qty: float, decimals: int = QTY_DECIMALS) -> float:
+    """Floor a quantity to the exchange's precision using Decimal.
+
+    Critically floors (never rounds up): a sell/stop order for even a hair
+    more than the held balance is rejected for insufficient quantity, which
+    would knock out the protective stop. Flooring guarantees qty <= holdings.
+    """
+    if qty <= 0:
+        return 0.0
+    quantum = Decimal(1).scaleb(-decimals)  # 1e-decimals
+    return float(Decimal(str(qty)).quantize(quantum, rounding=ROUND_DOWN))
 
 
 @dataclass
@@ -140,21 +158,38 @@ class Broker:
                                symbols=[symbol] if symbol else None)
         return list(self.trading.get_orders(req))
 
-    def submit_market_buy(self, symbol: str, qty: float):
+    def submit_market_buy(self, symbol: str, qty: float,
+                          client_order_id: Optional[str] = None):
         req = MarketOrderRequest(
-            symbol=symbol, qty=round(qty, 9), side=OrderSide.BUY,
-            time_in_force=TimeInForce.GTC)
+            symbol=symbol, qty=floor_qty(qty), side=OrderSide.BUY,
+            time_in_force=TimeInForce.GTC, client_order_id=client_order_id)
         return self.trading.submit_order(req)
 
-    def submit_stop_sell(self, symbol: str, qty: float, stop_price: float):
+    def submit_stop_sell(self, symbol: str, qty: float, stop_price: float,
+                         client_order_id: Optional[str] = None):
         """Server-side stop_limit sell — the hard/trailing stop."""
         stop_price = round_price(stop_price)
         limit_price = round_price(stop_price * (1.0 - self.STOP_LIMIT_SLIPPAGE))
         req = StopLimitOrderRequest(
-            symbol=symbol, qty=round(qty, 9), side=OrderSide.SELL,
+            symbol=symbol, qty=floor_qty(qty), side=OrderSide.SELL,
             time_in_force=TimeInForce.GTC,
-            stop_price=stop_price, limit_price=limit_price)
+            stop_price=stop_price, limit_price=limit_price,
+            client_order_id=client_order_id)
         return self.trading.submit_order(req)
+
+    def replace_stop(self, order_id: str, stop_price: float,
+                     client_order_id: Optional[str] = None):
+        """Atomically move a stop's price server-side (no cancel/resubmit gap).
+
+        Using replace avoids the window where the old stop is cancelled but the
+        new one isn't live yet, and avoids the exchange rejecting a second
+        full-qty sell whose quantity is still reserved by the first.
+        """
+        stop_price = round_price(stop_price)
+        limit_price = round_price(stop_price * (1.0 - self.STOP_LIMIT_SLIPPAGE))
+        req = ReplaceOrderRequest(stop_price=stop_price, limit_price=limit_price,
+                                  client_order_id=client_order_id)
+        return self.trading.replace_order_by_id(order_id, req)
 
     def cancel_order(self, order_id: str) -> None:
         try:
@@ -164,6 +199,18 @@ class Broker:
 
     def cancel_all_orders(self) -> None:
         self.trading.cancel_orders()
+
+    def position_exists(self, symbol: str) -> bool:
+        """True if Alpaca currently reports an open position for the symbol.
+
+        Used to disambiguate a failed close (network error vs. the position
+        already being gone because a server-side stop filled)."""
+        norm = normalize_symbol(symbol)
+        try:
+            return any(normalize_symbol(p.symbol) == norm
+                       for p in self.trading.get_all_positions())
+        except Exception:  # pragma: no cover
+            return True  # assume it still exists; safer than treating as gone
 
     def _resolve_asset_id(self, symbol: str):
         """Return the Alpaca asset-id (UUID) for an open position, or None.

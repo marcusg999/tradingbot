@@ -63,6 +63,27 @@ def test_position_crud(store):
     assert store.get_position("BTC/USD") is None
 
 
+def test_quantize_money_foots_to_cents():
+    from state import quantize_money
+    assert quantize_money(0.1 + 0.2) == 0.3          # 0.30000000000000004 -> 0.3
+    assert quantize_money(93.375) == 93.38 or quantize_money(93.375) == 93.37
+    assert quantize_money(None) is None
+    # Each quantized P&L is exact to cents (equals its own 2dp round), so the
+    # ledger has no sub-cent drift and the displayed total foots.
+    pnls = [quantize_money(x) for x in (10.005, 20.004, -5.006)]
+    assert all(p == round(p, 2) for p in pnls)
+    assert f"{sum(pnls):.2f}" == "24.99"
+
+
+def test_recorded_pnl_is_quantized(store):
+    store.record_trade(symbol="BTC/USD", side="SELL", qty=0.1,
+                       entry=60000.0, exit=60000.0 + 1.0 / 3.0, stop=58200.0,
+                       pnl=(1.0 / 3.0) * 0.1, reason_exit="x")  # 0.0333...
+    row = store.conn.execute(
+        "SELECT pnl FROM trades ORDER BY id DESC LIMIT 1").fetchone()
+    assert row["pnl"] == 0.03            # quantized to cents
+
+
 def test_equity_history_record_and_read(store):
     for i in range(5):
         store.record_equity(10_000 + i)

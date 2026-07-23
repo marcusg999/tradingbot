@@ -15,8 +15,10 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import signal
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -26,8 +28,26 @@ import config as config_module
 from broker import Broker, Candle, PositionInfo, normalize_symbol
 from logger import Notifier, get_logger, log_event
 from risk import RiskManager
+from single_instance import InstanceLock, LockHeldError
 from state import PositionRecord, State
 from strategy import Signal, generate_signal
+
+
+def _sanitize(symbol: str) -> str:
+    """Compact, id-safe symbol form for client_order_id."""
+    return re.sub(r"[^A-Za-z0-9]", "", symbol)
+
+
+def entry_coid(symbol: str, signal_ts: datetime) -> str:
+    """Deterministic per-signal-bar id so an entry can't double-submit across
+    retries or overlapping cycles (Alpaca dedupes by client_order_id)."""
+    return f"e-{_sanitize(symbol)}-{int(signal_ts.timestamp())}"
+
+
+def stop_coid(symbol: str) -> str:
+    """Fresh id per stop submission — dedupes an SDK/network retry of THIS
+    submit, without blocking an intentional later re-arm at the same level."""
+    return f"s-{_sanitize(symbol)}-{uuid.uuid4().hex[:12]}"
 
 
 class Engine:
@@ -159,7 +179,9 @@ class Engine:
         if has_stop:
             return
         try:
-            order = self.broker.submit_stop_sell(symbol, rec.qty, rec.stop_price)
+            order = self.broker.submit_stop_sell(
+                symbol, rec.qty, rec.stop_price,
+                client_order_id=stop_coid(symbol))
             rec.stop_order_id = getattr(order, "id", None)
             self.state.upsert_position(rec)
             self.log.warning("re-armed missing stop for %s at %.2f", symbol,
@@ -201,12 +223,21 @@ class Engine:
             rec.entry_price, rec.high_water_mark, current_price, rec.stop_price)
         rec.high_water_mark = max(rec.high_water_mark, current_price)
         if changed:
-            # Replace the server-side stop: cancel old, submit new.
-            if rec.stop_order_id:
-                self.broker.cancel_order(rec.stop_order_id)
+            # ATOMIC replace: move the stop's price in place rather than
+            # cancel-then-resubmit. This closes the window where the position
+            # would be momentarily unprotected between a cancel and a new
+            # submit. Fall back to a fresh submit only if replace fails (e.g.
+            # the order already filled/cancelled); _ensure_stop_order backstops.
             try:
-                order = self.broker.submit_stop_sell(symbol, rec.qty, new_stop)
-                rec.stop_order_id = getattr(order, "id", None)
+                if rec.stop_order_id:
+                    order = self.broker.replace_stop(
+                        rec.stop_order_id, new_stop,
+                        client_order_id=stop_coid(symbol))
+                else:
+                    order = self.broker.submit_stop_sell(
+                        symbol, rec.qty, new_stop,
+                        client_order_id=stop_coid(symbol))
+                rec.stop_order_id = getattr(order, "id", rec.stop_order_id)
                 rec.stop_price = new_stop
                 rec.trail_active = True
                 log_event(self.log, logging.INFO, "trailing stop raised",
@@ -215,7 +246,8 @@ class Engine:
                 self.notifier.send("Trailing stop raised",
                                    f"{symbol} → {new_stop:.2f} (px {current_price:.2f})")
             except Exception as exc:  # pragma: no cover
-                self.log.error("failed to raise trailing stop %s: %s", symbol, exc)
+                self.log.error("failed to raise trailing stop %s: %s — "
+                               "_ensure_stop_order will backstop", symbol, exc)
         self.state.upsert_position(rec)
 
     def _current_exposure(self, positions: Dict[str, PositionInfo]) -> float:
@@ -270,7 +302,8 @@ class Engine:
         self.exit(symbol, current_price, "stop_gap_forced_exit")
 
     def enter(self, symbol: str, price: float, equity: float,
-              exposure: float, data_age: float, reason: str) -> float:
+              exposure: float, data_age: float, reason: str,
+              signal_ts: datetime) -> float:
         """Attempt an entry. Returns the notional actually deployed (0.0 if
         rejected or failed) so the caller can keep its exposure total live."""
         plan = self.risk.plan_entry(equity, price, exposure, data_age)
@@ -281,7 +314,10 @@ class Engine:
         self.log.info("ENTER %s qty=%.8f @~%.2f stop=%.2f (%s)", symbol,
                       plan.qty, price, plan.stop_price, reason)
         try:
-            order = self.broker.submit_market_buy(symbol, plan.qty)
+            # Deterministic per-signal-bar id: a retry or an overlapping cycle
+            # cannot create a duplicate entry — Alpaca dedupes by this id.
+            order = self.broker.submit_market_buy(
+                symbol, plan.qty, client_order_id=entry_coid(symbol, signal_ts))
         except Exception as exc:
             self.log.error("market buy failed %s: %s", symbol, exc)
             return 0.0
@@ -306,7 +342,8 @@ class Engine:
             exit=None, stop=stop, pnl=None, reason_entry=reason, reason_exit="")
 
         try:
-            stop_order = self.broker.submit_stop_sell(symbol, qty, stop)
+            stop_order = self.broker.submit_stop_sell(
+                symbol, qty, stop, client_order_id=stop_coid(symbol))
             rec.stop_order_id = getattr(stop_order, "id", None)
             self.state.upsert_position(rec)
         except Exception as exc:  # pragma: no cover
@@ -348,13 +385,30 @@ class Engine:
         try:
             close_order = self.broker.close_position(symbol)
         except Exception as exc:
-            # The stop was already cancelled; the position must not be left
-            # naked. Re-arm the stop at its previous level before bailing.
+            # Disambiguate: did the close fail because of a transient error, or
+            # because the position is already gone (a server-side stop filled
+            # between the top-of-cycle snapshot and now)? Re-arming a stop for a
+            # position that no longer exists would be rejected / create a
+            # phantom order, so only re-arm if the position truly still exists.
+            if not self.broker.position_exists(symbol):
+                self.log.warning("%s already closed at Alpaca (stop filled "
+                                 "mid-cycle) — booking exit", symbol)
+                pnl = (rec.stop_price - rec.entry_price) * rec.qty
+                self.state.record_trade(
+                    symbol=symbol, side="SELL", qty=rec.qty,
+                    entry=rec.entry_price, exit=rec.stop_price,
+                    stop=rec.stop_price, pnl=pnl, reason_entry="",
+                    reason_exit="stop_filled_during_exit")
+                self.state.delete_position(symbol)
+                return
+            # Position still exists; the stop was cancelled above, so re-arm it
+            # to avoid leaving it naked.
             self.log.error("close_position failed %s: %s — re-arming stop",
                            symbol, exc)
             try:
-                order = self.broker.submit_stop_sell(symbol, rec.qty,
-                                                     rec.stop_price)
+                order = self.broker.submit_stop_sell(
+                    symbol, rec.qty, rec.stop_price,
+                    client_order_id=stop_coid(symbol))
                 rec.stop_order_id = getattr(order, "id", None)
                 self.state.upsert_position(rec)
             except Exception:
@@ -455,13 +509,22 @@ class Engine:
         data_age = max(0.0, (datetime.now(timezone.utc) -
                              (close_time + interval)).total_seconds())
 
-        # Fast path every cycle: trailing-stop ratchet, then verify a live
-        # server-side stop actually exists (heals any failed cancel/replace),
-        # then force out if price gapped through an unfilled stop-limit.
+        data_fresh = data_age <= self.c.max_data_staleness_sec
+
+        # Fast path every cycle. _ensure_stop_order uses only the STORED stop
+        # (no market price) so it runs regardless of freshness. Anything that
+        # acts on the live price — the trailing ratchet and the gap-forced
+        # market exit — is skipped on stale data so we never trade off a frozen
+        # feed. The server-side stop still protects the position meanwhile.
         if have_position:
-            self.manage_trailing_stop(norm, current_price)
             self._ensure_stop_order(norm)
-            self._check_stop_gap(norm, current_price)
+            if data_fresh:
+                self.manage_trailing_stop(norm, current_price)
+                self._check_stop_gap(norm, current_price)
+            else:
+                self.log.warning("%s: stale data %.0fs — skipping trailing/gap "
+                                 "checks (server-side stop still live)",
+                                 symbol, data_age)
 
         # Strategy path: only on a freshly closed candle.
         if self._last_candle_ts.get(symbol) == last_closed_ts:
@@ -482,13 +545,16 @@ class Engine:
                   slow_ema=None if result.slow_ema is None else round(result.slow_ema, 2),
                   rsi=None if result.rsi is None else round(result.rsi, 1))
 
+        if not data_fresh:
+            # Never open OR close on stale data. The server-side stop remains
+            # the safety net for an open position until fresh data returns.
+            self.log.warning("%s: stale data %.0fs — skipping signal action",
+                             symbol, data_age)
+            return 0.0
+
         if result.signal == Signal.ENTER_LONG and not have_position:
-            if data_age > self.c.max_data_staleness_sec:
-                self.log.warning("%s: skip entry, stale data %.0fs", symbol,
-                                 data_age)
-                return 0.0
             return self.enter(symbol, current_price, equity, exposure,
-                              data_age, result.reason)
+                              data_age, result.reason, last_closed_ts)
         elif result.signal == Signal.EXIT_LONG and have_position:
             self.exit(norm, current_price, result.reason)
         return 0.0
@@ -496,35 +562,48 @@ class Engine:
     def run(self) -> None:
         if not self._ready:
             return
-        if self._reset_kill_switch and self.state.is_kill_switch_active():
-            self.log.warning("KILL SWITCH MANUALLY RESET (was: %s). If you "
-                             "set RESET_KILL_SWITCH=yes, unset it now so a "
-                             "future halt isn't silently cleared on restart.",
-                             self.state.kill_switch_reason())
-            self.state.set_kill_switch(False, "manual_reset")
-        self.install_signal_handlers()
+        # Refuse to start if another instance is already trading this account.
+        lock = InstanceLock(self.c.state_db_path + ".lock")
         try:
-            self.reconcile()
-        except Exception as exc:
-            self.log.exception("reconcile failed: %s", exc)
+            lock.acquire()
+        except LockHeldError:
+            self.log.critical("another momentum-bot instance is already running "
+                              "(%s). Refusing to start a second one — two bots "
+                              "on one account submit duplicate orders. Exiting.",
+                              lock.path)
+            return
 
-        self.log.info("entering main loop (poll every %ds)",
-                      self.c.poll_interval_sec)
-        while not self._shutdown:
-            start = time.monotonic()
+        try:
+            if self._reset_kill_switch and self.state.is_kill_switch_active():
+                self.log.warning("KILL SWITCH MANUALLY RESET (was: %s). If you "
+                                 "set RESET_KILL_SWITCH=yes, unset it now so a "
+                                 "future halt isn't silently cleared on restart.",
+                                 self.state.kill_switch_reason())
+                self.state.set_kill_switch(False, "manual_reset")
+            self.install_signal_handlers()
             try:
-                self.run_once()
-            except Exception as exc:  # pragma: no cover
-                self.log.exception("cycle error: %s", exc)
-            elapsed = time.monotonic() - start
-            sleep_for = max(1.0, self.c.poll_interval_sec - elapsed)
-            # Sleep in small slices so SIGTERM is honored promptly.
-            slept = 0.0
-            while slept < sleep_for and not self._shutdown:
-                time.sleep(min(1.0, sleep_for - slept))
-                slept += 1.0
+                self.reconcile()
+            except Exception as exc:
+                self.log.exception("reconcile failed: %s", exc)
 
-        self.state.close()
+            self.log.info("entering main loop (poll every %ds)",
+                          self.c.poll_interval_sec)
+            while not self._shutdown:
+                start = time.monotonic()
+                try:
+                    self.run_once()
+                except Exception as exc:  # pragma: no cover
+                    self.log.exception("cycle error: %s", exc)
+                elapsed = time.monotonic() - start
+                sleep_for = max(1.0, self.c.poll_interval_sec - elapsed)
+                # Sleep in small slices so SIGTERM is honored promptly.
+                slept = 0.0
+                while slept < sleep_for and not self._shutdown:
+                    time.sleep(min(1.0, sleep_for - slept))
+                    slept += 1.0
+        finally:
+            lock.release()
+            self.state.close()
         self.log.info("shutdown complete. positions remain open; stops live at "
                       "Alpaca.")
 
